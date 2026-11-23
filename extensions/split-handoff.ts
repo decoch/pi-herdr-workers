@@ -1,4 +1,4 @@
-// Named, unfocused Herdr splits. Handoff crystallizes context with a model pass
+// Named, unfocused Herdr app splits (herdr-app + hc). Handoff crystallizes context with a model pass
 // before prompting the new pane; fork clones the branch without rewriting it.
 import { randomUUID } from "node:crypto";
 import { access, mkdir, writeFile } from "node:fs/promises";
@@ -16,6 +16,7 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { LABEL_NAME, appSpaces, findTerminal, inHerdrApp, piArgv, selfTerminal, setLabels, splitPane, terminalGet, terminalList } from "../lib/herdr-app.js";
 
 const ENTRY = "split-handoff.operation.v1";
 const CONTEXT_ENTRY = "split-handoff.context.v1";
@@ -41,7 +42,7 @@ type Mode = "handoff" | "fork";
 type Phase = "preparing" | "summarizing" | "pane-created" | "started" | "prompted" | "failed" | "interrupted";
 type Operation = {
   id: string; mode: Mode; phase: Phase; at: number; sourceSession: string;
-  name?: string; paneId?: string; direction?: "right" | "down";
+  name?: string; paneId?: string; terminal?: string; direction?: "right" | "down";
   sessionFile?: string; documentFile?: string; error?: string;
 };
 const clean = (s: string) => s.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").trim();
@@ -166,20 +167,14 @@ export default function (pi: ExtensionAPI) {
     pi.appendEntry(ENTRY, { ...op });
     paint(ctx);
   }
-  async function herdr(args: string[], signal: AbortSignal): Promise<any> {
-    signal.throwIfAborted();
-    const result = await pi.exec("herdr", args, { signal, timeout: args[1] === "start" ? 45000 : 15000 });
-    signal.throwIfAborted();
-    if (result.code !== 0 || result.killed) throw new Error(clean(result.stderr || result.stdout || `herdr ${args.slice(0, 2).join(" ")} failed`));
-    return result.stdout.trim() ? JSON.parse(result.stdout) : undefined;
-  }
+  const opts = (signal: AbortSignal, timeout = 15000) => ({ signal, timeout });
 
   pi.registerEntryRenderer<Operation>(ENTRY, (entry, { expanded }, theme) => {
     const op = entry.data;
     if (!op) return new Text("", 0, 0);
     const tone = op.phase === "prompted" ? "success" : op.phase === "failed" || op.phase === "interrupted" ? "warning" : "muted";
     let text = `split-${op.mode} · ${op.phase} · ${op.name || op.id.slice(0, 8)}`;
-    if (expanded) text += `\n${[op.paneId, op.sessionFile, op.documentFile, op.error].filter((s): s is string => typeof s === "string").map(clean).join("\n")}`;
+    if (expanded) text += `\n${[op.paneId, op.terminal, op.sessionFile, op.documentFile, op.error].filter((s): s is string => typeof s === "string").map(clean).join("\n")}`;
     return new Text(theme.fg(tone, text), 0, 0);
   });
   pi.on("session_start", (_event, ctx) => { disposed = false; ctxRef = ctx; paint(ctx); });
@@ -205,11 +200,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   const handle = (mode: Mode) => async (args: string, ctx: ExtensionCommandContext) => {
-    if (ctx.mode !== "tui" || process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) {
-      ctx.ui.notify("Splits require an interactive pi in a Herdr pane.", "error"); return;
+    if (ctx.mode !== "tui" || !inHerdrApp()) {
+      ctx.ui.notify("Splits require an interactive pi in a Herdr app pane.", "error"); return;
     }
     if (controller || !ctx.isIdle()) { ctx.ui.notify("Wait for the current operation to finish before splitting.", "warning"); return; }
-    const sourcePane = process.env.HERDR_PANE_ID;
+    const sourceTerminal = selfTerminal();
     const sourceFile = ctx.sessionManager.getSessionFile();
     const leaf = ctx.sessionManager.getLeafId();
     const branch = ctx.sessionManager.getBranch();
@@ -232,25 +227,23 @@ export default function (pi: ExtensionAPI) {
         save(ctx, active);
       }
       const used = new Set<string>();
-      const listed = await herdr(["agent", "list"], signal);
-      for (const agent of listed?.result?.agents ?? []) if (typeof agent.name === "string") used.add(agent.name);
+      for (const t of await terminalList(pi.exec, opts(signal))) if (t.name) used.add(t.name);
       const lastUser = branch.flatMap((e) => e.type === "message" && e.message.role === "user" ? [extractText(e.message.content)] : []).at(-1);
       const hint = args.trim() || ctx.sessionManager.getSessionName() || lastUser || mode;
       const name = await nameByTiny(ctx, hint, used, signal);
       signal.throwIfAborted();
       active.name = name;
-      const source = await herdr(["pane", "get", sourcePane], signal);
-      const sourceName = source?.result?.pane?.label || sourcePane;
-      let pane = sourcePane;
+      const self = await terminalGet(pi.exec, sourceTerminal, opts(signal));
+      const here = findTerminal(await appSpaces(pi.exec, opts(signal)), sourceTerminal);
+      if (!here) throw new Error(`Terminal ${sourceTerminal} is not shown in the Herdr app window.`);
+      const sourceName = self?.name || sourceTerminal;
+      // herdr-app reports no pane geometry: the first split goes right of this pane, later ones
+      // stack below the most recent split of this session that is still open in this tab.
+      let pane = here.pane;
       let direction: "right" | "down" = "right";
-      try {
-        const neighbor = await herdr(["pane", "neighbor", "--pane", sourcePane, "--direction", "right"], signal);
-        const right = neighbor?.result?.neighbor?.neighbor_pane_id;
-        if (right) {
-          const got = await herdr(["pane", "get", right], signal);
-          if (got?.result?.pane?.label?.startsWith("split-")) { pane = right; direction = "down"; }
-        }
-      } catch { signal.throwIfAborted(); }
+      const panesInTab = new Set(here.tab.terminals.map((t) => t.pane));
+      const previous = history(ctx).filter((o) => o.paneId && o.id !== active!.id && panesInTab.has(o.paneId)).at(-1);
+      if (previous?.paneId) { pane = previous.paneId; direction = "down"; }
       active.direction = direction;
 
       let prompt = wrapFork({ sourceName, instruction: args.trim() });
@@ -281,29 +274,27 @@ export default function (pi: ExtensionAPI) {
       }
       signal.throwIfAborted();
       save(ctx, active);
-      const split = await herdr(["pane", "split", "--pane", pane, "--direction", direction, "--cwd", ctx.cwd, "--no-focus"], signal);
-      const paneId = split?.result?.pane?.pane_id;
-      if (typeof paneId !== "string") throw new Error("Herdr did not return the created pane ID.");
-      active.paneId = paneId;
+      // The prompt goes in as pi's first message, so nothing races its startup.
+      const argv = [...piArgv(), ...(active.sessionFile ? ["--session", active.sessionFile] : []), "--", prompt];
+      const made = await splitPane(pi.exec, { pane, direction, cwd: ctx.cwd, argv }, opts(signal, 30000));
+      active.paneId = made.pane;
+      active.terminal = made.terminal;
       active.phase = "pane-created";
       save(ctx, active);
-      await herdr(["pane", "rename", paneId, name], signal);
-      await delay(1000, undefined, { signal });
-      const start = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", "30000"];
-      if (active.sessionFile) start.push("--", "--session", active.sessionFile);
-      await herdr(start, signal);
-      active.phase = "started";
-      save(ctx, active);
-      await herdr(["agent", "prompt", name, prompt], signal);
+      await setLabels(pi.exec, made.terminal, { [LABEL_NAME]: name }, opts(signal));
+      await delay(1500, undefined, { signal });
+      const started = await terminalGet(pi.exec, made.terminal, opts(signal));
+      if (!started?.live) throw new Error(`pi exited right after starting; check \`hc read ${made.terminal} --lines 80\`.`);
       active.phase = "prompted";
       save(ctx, active);
-      pi.sendMessage({ customType: "split-handoff.inbox", content: `/split-${mode} sent to ${name} (${paneId}).`, display: false }, { triggerTurn: false });
+      const paneId = made.pane;
+      pi.sendMessage({ customType: "split-handoff.inbox", content: `/split-${mode} sent to ${name} (${paneId}, terminal ${made.terminal}).`, display: false }, { triggerTurn: false });
     } catch (error) {
       if (!disposed && active) {
         active.phase = signal.aborted ? "interrupted" : "failed";
         active.error = clean(error instanceof Error ? error.message : String(error));
         save(ctx, active);
-        ctx.ui.notify(`Split ${active.phase}: ${active.error}${active.paneId ? ` · inspect ${active.paneId} before retrying` : " · inspect the Herdr layout before retrying"}`, "warning");
+        ctx.ui.notify(`Split ${active.phase}: ${active.error}${active.paneId ? ` · inspect ${active.paneId} before retrying` : " · inspect the Herdr app layout before retrying"}`, "warning");
       }
     } finally {
       controller = undefined;

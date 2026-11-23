@@ -36,7 +36,7 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
         const reuse = entry.reused ? "reused existing pane" : "new pane";
         return textResult(
           `Monitor #${entry.id} ${entry.reused ? "attached" : "started"} (${reuse})\n` +
-          `Tab: Monitor · pane ${entry.paneId}\n` +
+          `Tab: Monitor · pane ${entry.paneId} · terminal ${entry.terminalId}\n` +
           `Command: ${entry.command}\n` +
           `The pane stays open after the command ends. The same command reuses pane key mon:${entry.key}.`,
           {
@@ -44,7 +44,7 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
             action: "create",
             tone: "success",
             summary: `Monitor #${entry.id} ${entry.status} · ${params.description ?? entry.command.slice(0, 48)}`,
-            expanded: [`Pane: ${entry.paneId}`, `Key: mon:${entry.key}`, reuse],
+            expanded: [`Pane: ${entry.paneId}`, `Terminal: ${entry.terminalId}`, `Key: mon:${entry.key}`, reuse],
           },
         );
       } catch (error) {
@@ -75,13 +75,13 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
       for (const raw of monitors) {
         const m: HerdrMonitor = await manager.refresh(raw, signal);
         const icon = m.status === "running" ? ">" : m.status === "idle" ? "ok" : "x";
-        lines.push(`${icon} #${m.id} [${m.status}] ${m.command.slice(0, 60)} · pane ${m.paneId} (${formatAge(Date.now() - m.startedAt)})`);
+        lines.push(`${icon} #${m.id} [${m.status}] ${m.command.slice(0, 60)} · pane ${m.paneId} · terminal ${m.terminalId} (${formatAge(Date.now() - m.startedAt)})`);
         try {
-          const tail = await manager.readTail(m.paneId, 5, signal);
+          const tail = await manager.readTail(m.terminalId, 5, signal);
           for (const out of tail) lines.push(`  | ${out.slice(0, 100)}`);
         } catch {
           signal?.throwIfAborted();
-          lines.push("  | (could not read pane)");
+          lines.push("  | (could not read terminal)");
         }
       }
       updateWidget();

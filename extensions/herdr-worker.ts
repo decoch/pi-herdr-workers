@@ -1,12 +1,13 @@
 /**
- * Herdr worker — orchestrator/worker messaging between pi agents living in herdr panes.
+ * Herdr worker — orchestrator/worker messaging between pi agents living in Herdr app panes.
+ * Terminals are driven with `hc` (herdr-core) and the window with `herdr-app`; the old `herdr` TUI CLI is not used.
  *
  * Orchestrator side:
  *   /team add [right|down|left|up] [name]   start a pi worker agent-<name> (default agent-N) beside this
  *                                          pane; further workers stack along that side
  *   /team list                              show workers
  *   /team release <name>                    drop a worker (pane stays open)
- *   /team adopt <name>                      control an existing herdr agent without creating a pane
+ *   /team adopt <name>                      control an existing agent (hc address, hc name or team name) without creating a pane
  *
  * Worker side:
  *   pi --orchestrated-by <id>      (this is what /team add passes when starting the worker)
@@ -15,7 +16,7 @@
  *
  * Both sides get the SendToAgent tool. Delivery goes through a per-pane inbox that this
  * extension watches; receivers inject a durable custom message (steer when priority,
- * follow-up otherwise). Targets that are not a listening pi fall back to `herdr agent prompt`.
+ * follow-up otherwise). Targets that are not a listening pi fall back to `hc send`.
  */
 
 import * as fs from "node:fs";
@@ -25,14 +26,31 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
+import {
+	LABEL_NAME,
+	LABEL_TITLE,
+	appSpaces,
+	findTerminal,
+	hc,
+	inHerdrApp,
+	piArgv,
+	resolveTerminal,
+	selfTerminal,
+	setLabels,
+	splitPane,
+	swapPanes,
+	terminalGet,
+	terminalList,
+	type TerminalInfo,
+} from "../lib/herdr-app.js";
 
-// ───────────────────────── herdr env ─────────────────────────
+// ───────────────────────── herdr app env ─────────────────────────
 
-const HERDR_ENV = process.env.HERDR_ENV === "1";
-const SELF_PANE = process.env.HERDR_PANE_ID ?? "";
+const IN_APP = inHerdrApp();
+/** This pi's hc terminal address. Mailboxes and peer identity are keyed by it. */
+const SELF = selfTerminal();
 const ENTRY_TYPE = "herdr-worker";
 const STATUS_KEY = "herdr-worker";
-const META_SOURCE = "pi-herdr-worker";
 const TOOL_NAME = "SendToAgent";
 const CREATE_TOOL = "CreateAgentPanel";
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
@@ -40,7 +58,6 @@ const RESERVED = new Set(["add", "list", "release", "from", "status", "help", "a
 type Direction = "right" | "down" | "left" | "up";
 const DIRECTIONS: Direction[] = ["right", "down", "left", "up"];
 const isDirection = (s: string | undefined): s is Direction => !!s && (DIRECTIONS as string[]).includes(s);
-const SELF_TAB = process.env.HERDR_TAB_ID ?? "";
 const WORKER_PREFIX = "agent-";
 
 function mailboxRoot(): string {
@@ -50,14 +67,14 @@ function mailboxRoot(): string {
 function sanitize(id: string): string {
 	return id.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
-function mailboxDir(paneId: string): string {
-	return path.join(mailboxRoot(), sanitize(paneId));
+function mailboxDir(terminal: string): string {
+	return path.join(mailboxRoot(), sanitize(terminal));
 }
-function inboxDir(paneId: string): string {
-	return path.join(mailboxDir(paneId), "inbox");
+function inboxDir(terminal: string): string {
+	return path.join(mailboxDir(terminal), "inbox");
 }
-function listeningFile(paneId: string): string {
-	return path.join(mailboxDir(paneId), "listening.json");
+function listeningFile(terminal: string): string {
+	return path.join(mailboxDir(terminal), "listening.json");
 }
 
 // ───────────────────────── types ─────────────────────────
@@ -66,16 +83,18 @@ interface WorkerMeta {
 	type?: string; // e.g. "explore", "implement", "review"
 	purpose?: string; // free text, e.g. "explore only, never edit files"
 	model?: string; // provider/id
-	paneId?: string;
+	terminal?: string; // hc terminal address
+	pane?: string; // herdr-app pane id
+	direction?: Direction; // side of the orchestrator this worker's stack lives on
 }
 
 interface State {
 	version?: 1;
 	sessionId?: string;
 	teamMode?: boolean; // set once /team is used here -> this pi is an orchestrator
-	workers: string[]; // herdr agent names we orchestrate
+	workers: string[]; // agent names (or hc addresses) we orchestrate
 	meta?: Record<string, WorkerMeta>;
-	orchestratedBy?: string; // herdr agent name or pane id
+	orchestratedBy?: string; // agent name or hc terminal address
 	role?: { type?: string; purpose?: string }; // what our orchestrator said we are for
 }
 
@@ -93,7 +112,7 @@ const TYPE_HINTS: Record<string, string> = {
 };
 
 interface AgentInfo {
-	paneId: string;
+	terminal: string; // hc address
 	tabId?: string;
 	name?: string;
 	kind?: string;
@@ -103,7 +122,7 @@ interface AgentInfo {
 
 interface Envelope {
 	type: "message" | "control";
-	from: { id: string; paneId: string; name?: string; role: "orchestrator" | "worker" | "agent" };
+	from: { id: string; terminal: string; name?: string; role: "orchestrator" | "worker" | "agent" };
 	message: string;
 	priority: boolean;
 	ts: number;
@@ -119,7 +138,7 @@ function roleLabel(role: Envelope["from"]["role"]): string {
 
 function frameMessage(env: Envelope): string {
 	const label = roleLabel(env.from.role);
-	const who = env.from.name ? `${label} "${env.from.name}" in pane ${env.from.paneId}` : `${label} in pane ${env.from.paneId}`;
+	const who = env.from.name ? `${label} "${env.from.name}" in terminal ${env.from.terminal}` : `${label} in terminal ${env.from.terminal}`;
 	return [
 		`[agent] A message just arrived from another of your user's agents: ${who}.`,
 		"This is another agent reaching out — not the user typing here. It arrived asynchronously, and your user can already see it in this chat.",
@@ -143,10 +162,14 @@ export default function (pi: ExtensionAPI) {
 	const lifetime = new AbortController();
 	let createQueue = Promise.resolve();
 	const inFlightEnvelopes = new Set<string>();
-	const interactive = () => HERDR_ENV && !!SELF_PANE && ctxRef?.mode === "tui" && !stopped;
+	const interactive = () => IN_APP && !!SELF && ctxRef?.mode === "tui" && !stopped;
 
 	pi.registerFlag("orchestrated-by", {
-		description: "Herdr worker: id (agent name or pane id) of the orchestrator controlling this pi",
+		description: "Herdr worker: id (agent name or hc terminal address) of the orchestrator controlling this pi",
+		type: "string",
+	});
+	pi.registerFlag("team-name", {
+		description: "Herdr worker: this worker's team name (set by the orchestrator; also stored as an hc label)",
 		type: "string",
 	});
 	pi.registerFlag("team-role", {
@@ -154,40 +177,29 @@ export default function (pi: ExtensionAPI) {
 		type: "string",
 	});
 
-	// ── herdr helpers ──
+	// ── herdr app helpers ──
 
-	async function herdr(args: string[], opts: { timeout?: number; signal?: AbortSignal } = {}): Promise<any> {
-		const operationSignal = opts.signal ?? ctxRef?.signal;
+	function opts(o: { timeout?: number; signal?: AbortSignal } = {}) {
+		const operationSignal = o.signal ?? ctxRef?.signal;
 		const signal = operationSignal ? AbortSignal.any([operationSignal, lifetime.signal]) : lifetime.signal;
 		signal.throwIfAborted();
-		const res = await pi.exec("herdr", args, { timeout: opts.timeout ?? 15000, signal });
-		signal.throwIfAborted();
-		const out = (res.stdout || "").trim();
-		const err = (res.stderr || "").trim();
-		if (res.code !== 0) {
-			let msg = err || out || `herdr ${args[0]} ${args[1] ?? ""} failed (exit ${res.code})`;
-			try {
-				const j = JSON.parse(err || out);
-				msg = j.error?.message ? `${j.error.code}: ${j.error.message}` : msg;
-			} catch {}
-			throw new Error(msg);
-		}
-		try {
-			return JSON.parse(out);
-		} catch {
-			return out;
-		}
+		return { timeout: o.timeout ?? 15000, signal };
 	}
 
-	function toAgentInfo(a: any): AgentInfo | undefined {
-		if (!a?.pane_id) return undefined;
-		return { paneId: a.pane_id, tabId: a.tab_id ?? undefined, name: a.name ?? undefined, kind: a.agent ?? undefined, status: a.agent_status, cwd: a.cwd };
+	function toAgentInfo(t: TerminalInfo): AgentInfo {
+		return { terminal: t.address, tabId: t.tab, name: t.name, kind: t.app, status: t.status, cwd: t.cwd };
 	}
 
 	async function agentGet(target: string): Promise<AgentInfo | undefined> {
 		try {
-			const j = await herdr(["agent", "get", target]);
-			return toAgentInfo(j?.result?.agent);
+			// Workers we created are known by terminal; confirm it still carries that name.
+			const known = state.meta?.[target]?.terminal;
+			if (known) {
+				const t = await terminalGet(pi.exec, known, opts());
+				if (t?.live && t.name === target) return toAgentInfo(t);
+			}
+			const t = await resolveTerminal(pi.exec, target, opts());
+			return t ? toAgentInfo(t) : undefined;
 		} catch {
 			return undefined;
 		}
@@ -195,24 +207,29 @@ export default function (pi: ExtensionAPI) {
 
 	async function agentList(): Promise<AgentInfo[]> {
 		try {
-			const j = await herdr(["agent", "list"]);
-			return (j?.result?.agents ?? []).map(toAgentInfo).filter(Boolean) as AgentInfo[];
+			return (await terminalList(pi.exec, opts())).map(toAgentInfo);
 		} catch {
 			return [];
 		}
 	}
 
 	async function refreshSelf(): Promise<AgentInfo> {
-		selfInfo = (SELF_PANE && (await agentGet(SELF_PANE))) || { paneId: SELF_PANE };
+		const t = SELF ? await terminalGet(pi.exec, SELF, opts()).catch(() => undefined) : undefined;
+		selfInfo = t ? toAgentInfo(t) : { terminal: SELF };
+		const flagName = pi.getFlag("team-name");
+		if (!selfInfo.name && typeof flagName === "string" && flagName) {
+			selfInfo.name = flagName;
+			await setLabels(pi.exec, SELF, { [LABEL_NAME]: flagName }, opts()).catch(() => {});
+		}
 		return selfInfo;
 	}
 
 	function selfId(): string {
-		return selfInfo?.name || selfInfo?.paneId || SELF_PANE || "unknown";
+		return selfInfo?.name || selfInfo?.terminal || SELF || "unknown";
 	}
 
 	function myRoleToward(targetId: string, target?: AgentInfo): Envelope["from"]["role"] {
-		const ids = [targetId, target?.name, target?.paneId].filter(Boolean) as string[];
+		const ids = [targetId, target?.name, target?.terminal].filter(Boolean) as string[];
 		if (ids.some((id) => state.workers.includes(id))) return "orchestrator";
 		if (state.orchestratedBy && ids.includes(state.orchestratedBy)) return "worker";
 		return "agent";
@@ -278,16 +295,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function updatePaneTitle() {
-		if (!HERDR_ENV || !SELF_PANE) return;
+		if (!IN_APP || !SELF) return;
+		// herdr-app has no per-pane title API; keep the team role visible as an hc label.
+		let title: string | undefined;
+		if (state.orchestratedBy) title = `${selfInfo?.name ? `${selfInfo.name} ` : ""}⇐ ${state.orchestratedBy}`;
+		else if (state.workers.length) title = `orchestrating ${state.workers.join(", ")}`;
 		try {
-			if (state.orchestratedBy) {
-				const me = selfInfo?.name ? `${selfInfo.name} ` : "";
-				await herdr(["pane", "report-metadata", SELF_PANE, "--source", META_SOURCE, "--title", `${me}⇐ ${state.orchestratedBy}`]);
-			} else if (state.workers.length) {
-				await herdr(["pane", "report-metadata", SELF_PANE, "--source", META_SOURCE, "--title", `orchestrating ${state.workers.join(", ")}`]);
-			} else {
-				await herdr(["pane", "report-metadata", SELF_PANE, "--source", META_SOURCE, "--clear-title"]);
-			}
+			await setLabels(pi.exec, SELF, { [LABEL_TITLE]: title }, opts());
 		} catch {}
 	}
 
@@ -295,9 +309,9 @@ export default function (pi: ExtensionAPI) {
 
 	function startListening() {
 		if (!interactive() || watcher || poller) return;
-		const dir = inboxDir(SELF_PANE);
+		const dir = inboxDir(SELF);
 		fs.mkdirSync(dir, { recursive: true });
-		fs.writeFileSync(listeningFile(SELF_PANE), JSON.stringify({ pid: process.pid, ts: Date.now(), id: selfId() }));
+		fs.writeFileSync(listeningFile(SELF), JSON.stringify({ pid: process.pid, ts: Date.now(), id: selfId() }));
 		try {
 			watcher = fs.watch(dir, () => void drainInbox());
 		} catch {}
@@ -312,7 +326,7 @@ export default function (pi: ExtensionAPI) {
 		if (poller) clearInterval(poller);
 		poller = undefined;
 		try {
-			fs.rmSync(listeningFile(SELF_PANE), { force: true });
+			fs.rmSync(listeningFile(SELF), { force: true });
 		} catch {}
 	}
 
@@ -320,7 +334,7 @@ export default function (pi: ExtensionAPI) {
 		if (draining || !interactive()) return;
 		draining = true;
 		try {
-			const dir = inboxDir(SELF_PANE);
+			const dir = inboxDir(SELF);
 			let files: string[] = [];
 			try {
 				files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
@@ -355,12 +369,12 @@ export default function (pi: ExtensionAPI) {
 	 */
 	async function knownPeerPanes(): Promise<Map<string, string>> {
 		const ids = [...state.workers, ...(state.orchestratedBy ? [state.orchestratedBy] : [])];
-		const out = new Map<string, string>(); // paneId -> id we know it by
+		const out = new Map<string, string>(); // terminal -> id we know it by
 		if (!ids.length) return out;
 		const agents = await agentList();
 		for (const id of ids) {
-			const a = agents.find((x) => x.name === id || x.paneId === id);
-			if (a) out.set(a.paneId, id);
+			const a = agents.find((x) => x.name === id || x.terminal === id);
+			if (a) out.set(a.terminal, id);
 		}
 		return out;
 	}
@@ -370,13 +384,13 @@ export default function (pi: ExtensionAPI) {
 		if (!env.from || typeof env.from.id !== "string" || typeof env.message !== "string") return;
 		const peers = await knownPeerPanes();
 		if (stopped) return;
-		const known = env.from?.paneId ? peers.get(env.from.paneId) : undefined;
+		const known = env.from?.terminal ? peers.get(env.from.terminal) : undefined;
 
 		if (env.type === "control") {
 			if (env.action === "orchestrated-by") {
 				// Adoption handshake: only while we have no orchestrator (or it is the current one re-asserting).
 				if (state.orchestratedBy && !known) {
-					ctx?.hasUI && ctx.ui.notify(`Ignored adoption request from ${env.from.id} (pane ${env.from.paneId}); already orchestrated by ${state.orchestratedBy}.`, "warning");
+					ctx?.hasUI && ctx.ui.notify(`Ignored adoption request from ${env.from.id} (terminal ${env.from.terminal}); already orchestrated by ${state.orchestratedBy}.`, "warning");
 					return;
 				}
 				state.orchestratedBy = env.from.id;
@@ -395,7 +409,7 @@ export default function (pi: ExtensionAPI) {
 		if (!known) {
 			ctx?.hasUI &&
 				ctx.ui.notify(
-					`Dropped message from unknown agent ${env.from?.id ?? "?"} (pane ${env.from?.paneId ?? "?"}). Only your orchestrator and workers may message you; use /team adopt or /orchestrated-by to allow it.`,
+					`Dropped message from unknown agent ${env.from?.id ?? "?"} (terminal ${env.from?.terminal ?? "?"}). Only your orchestrator and workers may message you; use /team adopt or /orchestrated-by to allow it.`,
 					"warning",
 				);
 			return;
@@ -408,9 +422,9 @@ export default function (pi: ExtensionAPI) {
 
 	// ── sending ──
 
-	function isListening(paneId: string): boolean {
+	function isListening(terminal: string): boolean {
 		try {
-			const j = JSON.parse(fs.readFileSync(listeningFile(paneId), "utf8"));
+			const j = JSON.parse(fs.readFileSync(listeningFile(terminal), "utf8"));
 			if (typeof j.pid !== "number") return false;
 			process.kill(j.pid, 0);
 			return true;
@@ -419,8 +433,8 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function writeEnvelope(paneId: string, env: Envelope) {
-		const dir = inboxDir(paneId);
+	function writeEnvelope(terminal: string, env: Envelope) {
+		const dir = inboxDir(terminal);
 		fs.mkdirSync(dir, { recursive: true });
 		const name = `${String(env.ts).padStart(15, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
 		const tmp = path.join(dir, `.${name}.tmp`);
@@ -432,7 +446,7 @@ export default function (pi: ExtensionAPI) {
 		if (!selfInfo) await refreshSelf();
 		return {
 			type: "message",
-			from: { id: selfId(), paneId: SELF_PANE, name: selfInfo?.name, role: myRoleToward(targetId, target) },
+			from: { id: selfId(), terminal: SELF, name: selfInfo?.name, role: myRoleToward(targetId, target) },
 			message,
 			priority,
 			ts: Date.now(),
@@ -441,14 +455,14 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function send(targetId: string, message: string, priority: boolean, signal?: AbortSignal): Promise<string> {
-		if (!HERDR_ENV) throw new Error("Not running inside herdr (HERDR_ENV != 1); SendToAgent is unavailable.");
+		if (!IN_APP) throw new Error("Not running inside the Herdr app (no HC_TERMINAL_ID); SendToAgent is unavailable.");
 		const target = await agentGet(targetId);
 		if (!target) {
-			const known = (await agentList()).map((a) => a.name ?? a.paneId);
-			throw new Error(`No live herdr agent "${targetId}". Known agents: ${known.join(", ") || "(none)"}${state.workers.length ? `. Your workers: ${state.workers.join(", ")}` : ""}${state.orchestratedBy ? `. Your orchestrator: ${state.orchestratedBy}` : ""}`);
+			const known = (await agentList()).map((a) => a.name ?? a.terminal);
+			throw new Error(`No live agent "${targetId}". Known agents: ${known.join(", ") || "(none)"}${state.workers.length ? `. Your workers: ${state.workers.join(", ")}` : ""}${state.orchestratedBy ? `. Your orchestrator: ${state.orchestratedBy}` : ""}`);
 		}
-		if (target.paneId === SELF_PANE) throw new Error("Refusing to send a message to yourself.");
-		const peer = state.workers.includes(targetId) || state.workers.includes(target.name ?? "") || state.workers.includes(target.paneId) || [state.orchestratedBy].includes(targetId) || [state.orchestratedBy].includes(target.name ?? "") || [state.orchestratedBy].includes(target.paneId);
+		if (target.terminal === SELF) throw new Error("Refusing to send a message to yourself.");
+		const peer = state.workers.includes(targetId) || state.workers.includes(target.name ?? "") || state.workers.includes(target.terminal) || [state.orchestratedBy].includes(targetId) || [state.orchestratedBy].includes(target.name ?? "") || [state.orchestratedBy].includes(target.terminal);
 		if (!peer) {
 			throw new Error(
 				`"${targetId}" is not in your team (it would drop the message anyway). Workers: ${state.workers.join(", ") || "(none)"}; orchestrator: ${state.orchestratedBy ?? "(none)"}. Use /team add or /team adopt first.`,
@@ -456,23 +470,24 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const env = await makeEnvelope(targetId, target, message, priority);
-		const label = target.name ?? target.paneId;
+		const label = target.name ?? target.terminal;
 
-		if (target.kind === "pi" && isListening(target.paneId)) {
-			writeEnvelope(target.paneId, env);
-			return `Delivered to ${label} (pane ${target.paneId}, ${target.status ?? "unknown"}) via inbox as ${priority ? "steer (priority)" : "follow-up"}. Replies arrive on a later turn.`;
+		if (target.kind === "pi" && isListening(target.terminal)) {
+			writeEnvelope(target.terminal, env);
+			return `Delivered to ${label} (terminal ${target.terminal}, ${target.status ?? "unknown"}) via inbox as ${priority ? "steer (priority)" : "follow-up"}. Replies arrive on a later turn.`;
 		}
 
 		// Fallback: type it into the agent's pane. No steer/follow-up control here.
-		await herdr(["agent", "prompt", target.paneId, frameMessage(env)], { timeout: 20000, signal });
-		return `Typed into ${label} (pane ${target.paneId}, ${target.kind ?? "agent"}, no inbox listener) via \`herdr agent prompt\`. Priority flag not applicable there.`;
+		// hc send holds while a person has an unfinished draft (up to ~60s), so allow for that.
+		await hc(pi.exec, ["send", target.terminal, frameMessage(env)], opts({ timeout: 90000, signal }));
+		return `Typed into ${label} (terminal ${target.terminal}, ${target.kind ?? "agent"}, no inbox listener) via \`hc send\`. Priority flag not applicable there.`;
 	}
 
 	async function sendControl(targetId: string, action: NonNullable<Envelope["action"]>): Promise<boolean> {
 		const target = await agentGet(targetId);
-		if (!target || !isListening(target.paneId)) return false;
+		if (!target || !isListening(target.terminal)) return false;
 		const env = await makeEnvelope(targetId, target, "", false, { type: "control", action });
-		writeEnvelope(target.paneId, env);
+		writeEnvelope(target.terminal, env);
 		return true;
 	}
 
@@ -482,17 +497,17 @@ export default function (pi: ExtensionAPI) {
 		name: "SendToAgent",
 		label: "Send To Agent",
 		description:
-			"Send a message to another of your user's agents running in a herdr pane (an orchestrator or a worker). " +
+			"Send a message to another of your user's agents running in a Herdr app pane (an orchestrator or a worker). " +
 			"The message is delivered asynchronously and shows up in their chat as an '[agent] ...' custom message; replies come back the same way on a later turn. " +
-			"target_id is the herdr agent name (e.g. a worker name) or pane id. priority=true steers the target mid-task (interrupts its current turn); priority=false queues a follow-up after its current work finishes.",
-		promptSnippet: "Message another herdr-hosted agent (orchestrator ↔ worker) asynchronously",
+			"target_id is the agent name (e.g. a worker name) or hc terminal address (e.g. t3y). priority=true steers the target mid-task (interrupts its current turn); priority=false queues a follow-up after its current work finishes.",
+		promptSnippet: "Message another Herdr-hosted agent (orchestrator ↔ worker) asynchronously",
 		promptGuidelines: [
 			"Use SendToAgent to delegate to workers or report back to your orchestrator; write self-contained messages with goal, context, constraints, and what to report back.",
 			"SendToAgent is fire-and-forget: do not wait or poll for a reply — end your turn and react when the '[agent]' message arrives.",
 		],
 		parameters: Type.Object({
 			message: Type.String({ description: "Full message body (Markdown). Self-contained: the recipient does not see your conversation." }),
-			target_id: Type.String({ description: "Herdr agent name or pane id of the recipient" }),
+			target_id: Type.String({ description: "Agent name or hc terminal address of the recipient" }),
 			priority: Type.Optional(Type.Boolean({ description: "true = steer (interrupt recipient's current turn). false/omitted = follow-up after its current work.", default: false })),
 		}),
 		async execute(_id, params, signal) {
@@ -528,20 +543,20 @@ export default function (pi: ExtensionAPI) {
 
 	async function adopt(name: string): Promise<string> {
 		const existing = await agentGet(name);
-		if (!existing) throw new Error(`No live herdr agent "${name}" to adopt.`);
-		if (existing.paneId === SELF_PANE) throw new Error("That is this pane.");
+		if (!existing) throw new Error(`No live agent "${name}" to adopt.`);
+		if (existing.terminal === SELF) throw new Error("That is this terminal.");
 		await refreshSelf();
 		if (!state.workers.includes(name)) state.workers.push(name);
 		persist();
 		updateUi();
 		const ok = await sendControl(name, "orchestrated-by");
 		return ok
-			? `Adopted existing agent ${name} (pane ${existing.paneId}) as worker.`
-			: `Adopted ${name} (pane ${existing.paneId}) — it is not a listening pi; run \`/orchestrated-by ${selfId()}\` inside it (or it can't SendToAgent back).`;
+			? `Adopted existing agent ${name} (terminal ${existing.terminal}) as worker.`
+			: `Adopted ${name} (terminal ${existing.terminal}) — it is not a listening pi; run \`/orchestrated-by ${selfId()}\` inside it (or it can't SendToAgent back).`;
 	}
 
 	/**
-	 * All workers are named `agent-<something>` (herdr agent names are global, so the prefix both
+	 * All workers are named `agent-<something>` (team names are global labels, so the prefix both
 	 * avoids clashes with hand-started agents and marks the pane as part of the worker stack).
 	 * `/team add`           -> agent-1, agent-2, … (first free number)
 	 * `/team add ci`        -> agent-ci, or agent-ci-2, … if taken
@@ -564,48 +579,28 @@ export default function (pi: ExtensionAPI) {
 
 	/**
 	 * Workers live in a stack on one side of the orchestrator (default: a column to the right).
-	 * - Nothing (or a non-worker) on that side -> split the orchestrator toward `dir`.
-	 *   herdr can only split right/down, so left/up = split right/down, then swap the two panes.
-	 * - An `agent-*` pane on that side -> walk along the stack (down for a left/right column,
-	 *   right for an up/down row) and split the last one to extend it.
+	 * herdr-app reports no pane geometry, so the stack is tracked in our own state:
+	 * - No live worker of ours on that side in this tab -> split the orchestrator toward `dir`.
+	 *   Panes split only right/down, so left/up = split right/down, then swap the two panes.
+	 * - Otherwise -> split the most recent live worker on that side along the stack
+	 *   (down for a left/right column, right for an up/down row).
 	 */
-	async function pickSplit(dir: Direction): Promise<{ pane: string; direction: "right" | "down"; swap: boolean; how: string }> {
-		// `herdr pane neighbor` is focus-relative, so derive adjacency from the layout rects.
-		type Rect = { x: number; y: number; width: number; height: number };
-		const layout = await herdr(["pane", "layout", "--pane", SELF_PANE]).catch(() => undefined);
-		const rects = new Map<string, Rect>();
-		for (const p of layout?.result?.layout?.panes ?? []) if (p?.pane_id && p.rect) rects.set(p.pane_id, p.rect);
-		const agents = await agentList();
-		const workerPanes = new Set(agents.filter((a) => a.tabId === SELF_TAB && a.name?.startsWith(WORKER_PREFIX)).map((a) => a.paneId));
-		const overlaps = (a0: number, a1: number, b0: number, b1: number) => Math.min(a1, b1) - Math.max(a0, b0) > 0;
-		const adjacent = (id: string, d: Direction): string | undefined => {
-			const r = rects.get(id);
-			if (!r) return undefined;
-			const hit = [...rects].find(([pid, o]) => {
-				if (pid === id) return false;
-				switch (d) {
-					case "right": return Math.abs(o.x - (r.x + r.width)) <= 1 && overlaps(r.y, r.y + r.height, o.y, o.y + o.height);
-					case "left": return Math.abs(r.x - (o.x + o.width)) <= 1 && overlaps(r.y, r.y + r.height, o.y, o.y + o.height);
-					case "down": return Math.abs(o.y - (r.y + r.height)) <= 1 && overlaps(r.x, r.x + r.width, o.x, o.x + o.width);
-					case "up": return Math.abs(r.y - (o.y + o.height)) <= 1 && overlaps(r.x, r.x + r.width, o.x, o.x + o.width);
-				}
-			});
-			return hit?.[0];
-		};
-
-		const first = adjacent(SELF_PANE, dir);
-		if (!first || !workerPanes.has(first)) {
+	async function pickSplit(dir: Direction): Promise<{ selfPane: string; pane: string; direction: "right" | "down"; swap: boolean; how: string }> {
+		const spaces = await appSpaces(pi.exec, opts());
+		const here = findTerminal(spaces, SELF);
+		if (!here) throw new Error(`Terminal ${SELF} is not shown in the Herdr app window.`);
+		const panesInTab = new Map(here.tab.terminals.map((t) => [t.terminal, t.pane]));
+		const stack = state.workers
+			.map((w) => state.meta?.[w])
+			.filter((m): m is WorkerMeta => !!m?.terminal && (m.direction ?? "right") === dir && panesInTab.has(m.terminal));
+		const last = stack.at(-1);
+		if (!last) {
 			const native: "right" | "down" = dir === "left" || dir === "right" ? "right" : "down";
-			return { pane: SELF_PANE, direction: native, swap: dir === "left" || dir === "up", how: `new ${native === "right" ? "column" : "row"} ${dir}` };
+			return { selfPane: here.pane, pane: here.pane, direction: native, swap: dir === "left" || dir === "up", how: `new ${native === "right" ? "column" : "row"} ${dir}` };
 		}
-		const along: Direction = dir === "left" || dir === "right" ? "down" : "right";
-		let last = first;
-		for (let i = 0; i < 64; i++) {
-			const next = adjacent(last, along);
-			if (!next || !workerPanes.has(next)) break;
-			last = next;
-		}
-		return { pane: last, direction: along, swap: false, how: `stacked ${along === "down" ? "below" : "right of"} ${last}` };
+		const along: "right" | "down" = dir === "left" || dir === "right" ? "down" : "right";
+		const pane = panesInTab.get(last.terminal!)!;
+		return { selfPane: here.pane, pane, direction: along, swap: false, how: `stacked ${along === "down" ? "below" : "right of"} ${last.terminal}` };
 	}
 
 	interface CreateOpts {
@@ -618,69 +613,57 @@ export default function (pi: ExtensionAPI) {
 		initialPrompt?: string;
 	}
 
-	async function createAgent(opts: CreateOpts, ctx: ExtensionContext): Promise<{ name: string; paneId: string; model?: string; how: string; adopted?: boolean }> {
-		if (!HERDR_ENV || !SELF_PANE) throw new Error("Not running inside herdr.");
-		const dir: Direction = opts.direction ?? "right";
-		const type = opts.type?.trim().toLowerCase() || undefined;
-		const requested = (opts.name?.trim() || type || "").toLowerCase();
+	async function createAgent(o: CreateOpts, ctx: ExtensionContext): Promise<{ name: string; terminal: string; pane?: string; model?: string; how: string; adopted?: boolean }> {
+		if (!IN_APP || !SELF) throw new Error("Not running inside the Herdr app.");
+		const dir: Direction = o.direction ?? "right";
+		const type = o.type?.trim().toLowerCase() || undefined;
+		const requested = (o.name?.trim() || type || "").toLowerCase();
 		if (requested && (!NAME_RE.test(requested) || RESERVED.has(requested))) throw new Error(`Invalid worker name "${requested}" (use [a-z][a-z0-9_-]{0,31}; not ${[...RESERVED].join("/")})`);
-		const model = opts.model?.trim() || (type && TYPE_MODELS[type]) || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+		const model = o.model?.trim() || (type && TYPE_MODELS[type]) || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
 
 		await refreshSelf();
-		// Give ourselves an addressable name if we don't have one.
-		if (!selfInfo?.name) {
-			try {
-				await herdr(["agent", "rename", SELF_PANE, "orchestrator"]);
-				await refreshSelf();
-			} catch {}
-		}
 		const me = selfId();
 
 		// Re-adopt an existing same-tab worker with that name (e.g. after /reload or a dropped session).
 		if (requested) {
 			const wanted = requested.startsWith(WORKER_PREFIX) ? requested : `${WORKER_PREFIX}${requested}`;
 			const existing = await agentGet(wanted);
-			if (existing && existing.paneId !== SELF_PANE && existing.tabId === SELF_TAB && !state.workers.includes(wanted)) {
+			if (existing && existing.terminal !== SELF && existing.tabId === selfInfo?.tabId && !state.workers.includes(wanted)) {
 				await adopt(wanted);
-				if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false);
-				return { name: wanted, paneId: existing.paneId, how: "re-adopted existing pane", adopted: true };
+				if (o.initialPrompt) await send(wanted, o.initialPrompt, false);
+				return { name: wanted, terminal: existing.terminal, how: "re-adopted existing pane", adopted: true };
 			}
 		}
 		const name = await uniqueName(requested);
 
-		// Create the pane: start a worker stack on the requested side, or extend the existing one.
+		// Create the pane running pi: start a worker stack on the requested side, or extend the existing one.
 		const target = await pickSplit(dir);
-		const split = await herdr(["pane", "split", target.pane, "--direction", target.direction, "--cwd", ctx.cwd, "--no-focus"]);
-		const paneId: string | undefined = split?.result?.pane?.pane_id;
-		if (!paneId) throw new Error(`pane split returned no pane id: ${JSON.stringify(split)}`);
-		pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "pane-created", at: Date.now() });
-		if (target.swap) {
-			await herdr(["pane", "swap", "--source-pane", SELF_PANE, "--target-pane", paneId]).catch(() => {});
-		}
-
-		await new Promise((r) => setTimeout(r, 1200)); // let the shell come up
-		const piArgs = ["--orchestrated-by", me];
-		if (model) piArgs.push("--model", opts.thinking ? `${model}:${opts.thinking}` : model);
-		const role = [type, opts.purpose?.trim()].filter(Boolean).join(": ");
+		const piArgs = ["--orchestrated-by", me, "--team-name", name];
+		if (model) piArgs.push("--model", o.thinking ? `${model}:${o.thinking}` : model);
+		const role = [type, o.purpose?.trim()].filter(Boolean).join(": ");
 		if (role) piArgs.push("--team-role", role);
-		try {
-			await herdr(["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--", ...piArgs], { timeout: 70000 });
-		} catch (e: any) {
-			if (!stopped) pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "start-failed", at: Date.now() });
-			throw new Error(`Started pane ${paneId} but agent start failed: ${e.message}. Check \`herdr pane read ${paneId}\`.`);
-		}
+		const made = await splitPane(pi.exec, { pane: target.pane, direction: target.direction, cwd: ctx.cwd, argv: [...piArgv(), ...piArgs] }, opts({ timeout: 30000 }));
+		pi.appendEntry("herdr-worker.operation.v1", { name, terminal: made.terminal, pane: made.pane, phase: "pane-created", at: Date.now() });
+		// pane.split cannot name the terminal; the label makes it addressable by name.
+		await setLabels(pi.exec, made.terminal, { [LABEL_NAME]: name }, opts()).catch(() => {});
+		if (target.swap) await swapPanes(pi.exec, target.selfPane, made.pane, opts()).catch(() => {});
 
+		// Wait for the worker's extension to come up and register its inbox.
+		for (let i = 0; i < 120 && !isListening(made.terminal) && !stopped; i++) {
+			await new Promise((r) => setTimeout(r, 500));
+			if (i % 4 !== 3 || isListening(made.terminal)) continue;
+			const t = await terminalGet(pi.exec, made.terminal, opts()).catch(() => undefined);
+			if (!t?.live) {
+				if (!stopped) pi.appendEntry("herdr-worker.operation.v1", { name, terminal: made.terminal, phase: "start-failed", at: Date.now() });
+				throw new Error(`Pane ${made.pane} was created but pi exited. Check \`hc read ${made.terminal} --lines 80\`.`);
+			}
+		}
 		if (!state.workers.includes(name)) state.workers.push(name);
-		state.meta = { ...(state.meta ?? {}), [name]: { type, purpose: opts.purpose?.trim() || undefined, model, paneId } };
+		state.meta = { ...(state.meta ?? {}), [name]: { type, purpose: o.purpose?.trim() || undefined, model, terminal: made.terminal, pane: made.pane, direction: dir } };
 		persist();
 		updateUi();
-
-		if (opts.initialPrompt?.trim()) {
-			// Wait for the worker's extension to come up and register its inbox, then hand over the brief.
-			for (let i = 0; i < 20 && !isListening(paneId); i++) await new Promise((r) => setTimeout(r, 500));
-			await send(name, opts.initialPrompt, false);
-		}
-		return { name, paneId, model, how: target.how };
+		if (o.initialPrompt?.trim()) await send(name, o.initialPrompt, false);
+		return { name, terminal: made.terminal, pane: made.pane, model, how: target.how };
 	}
 
 	async function release(name: string): Promise<string> {
@@ -694,7 +677,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function setOrchestrator(id: string): Promise<string> {
-		if (!id) throw new Error("Usage: /orchestrated-by <agent name or pane id>");
+		if (!id) throw new Error("Usage: /orchestrated-by <agent name or hc terminal address>");
 		state.orchestratedBy = id;
 		persist();
 		updateUi();
@@ -707,11 +690,11 @@ export default function (pi: ExtensionAPI) {
 		name: CREATE_TOOL,
 		label: "Create Agent Panel",
 		description:
-			"Create a new team member: splits a herdr pane next to you and starts a pi worker there that is orchestrated by you. " +
+			"Create a new team member: splits a Herdr app pane next to you and starts a pi worker there that is orchestrated by you. " +
 			"Workers are named agent-<name> (default agent-<type> or agent-N). Use `type` to describe the kind of agent (explore, research, review, implement, test, …) and `purpose` for a one-line charter " +
 			"(e.g. 'explore only, never edit files'). `model` defaults to your own model, except explore/research default to xai/grok-4.6. " +
 			"`initial_prompt` is delivered as the worker's first brief right after startup. Returns the worker's id for SendToAgent.",
-		promptSnippet: "Spawn a new orchestrated pi worker in a neighboring herdr pane (type, purpose, model, initial brief)",
+		promptSnippet: "Spawn a new orchestrated pi worker in a neighboring Herdr pane (type, purpose, model, initial brief)",
 		promptGuidelines: [
 			"Use CreateAgentPanel when the user asks for a new team member / worker / agent panel, or when a task benefits from a separate agent (e.g. an explore-only scout). Give it a concrete initial_prompt.",
 		],
@@ -736,7 +719,7 @@ export default function (pi: ExtensionAPI) {
 			const r = await pending;
 			const meta = state.meta?.[r.name];
 			const text = [
-				`Worker ${r.name} ready in pane ${r.paneId} (${r.how}).`,
+				`Worker ${r.name} ready in terminal ${r.terminal}${r.pane ? ` / pane ${r.pane}` : ""} (${r.how}).`,
 				meta?.type || meta?.purpose ? `Role: ${[meta?.type, meta?.purpose].filter(Boolean).join(" — ")}` : undefined,
 				r.model ? `Model: ${r.model}` : undefined,
 				params.initial_prompt ? "Initial brief delivered; its report will arrive as an [agent] message on a later turn." : `No initial brief given; use SendToAgent({ target_id: "${r.name}", … }) to task it.`,
@@ -781,7 +764,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const purpose = rest.join(" ").replace(/^["']|["']$/g, "").trim();
 		const lines = [
-			`Add a team member now using the CreateAgentPanel tool (do not use herdr CLI commands for this).`,
+			`Add a team member now using the CreateAgentPanel tool (do not use hc / herdr-app commands for this).`,
 			`- direction: ${dir ?? "right"}`,
 			type ? `- type: ${type}${TYPE_HINTS[type] ? ` (${TYPE_HINTS[type]})` : ""}` : `- type: (none given — pick one that fits, or leave it generic)`,
 			purpose ? `- purpose: ${purpose}` : `- purpose: (not given — write a one-line charter${type ? ` for a ${type} agent` : ""})`,
@@ -805,13 +788,13 @@ export default function (pi: ExtensionAPI) {
 				{ value: "list", label: "list", description: "Show workers / orchestrator" },
 				...state.workers.map((w) => ({ value: `release ${w}`, label: `release ${w}`, description: "Stop orchestrating this worker" })),
 				{ value: "from ", label: "from <id>", description: "Mark this pi as a worker of <id>" },
-				{ value: "adopt ", label: "adopt <name>", description: "Control an existing herdr agent without creating a pane" },
+				{ value: "adopt ", label: "adopt <name>", description: "Control an existing agent without creating a pane" },
 			].filter((i) => i.value.startsWith(prefix));
 			return items.length ? items : null;
 		},
 		handler: async (args, ctx) => {
 			const [verb, ...rest] = args.trim().split(/\s+/).filter(Boolean);
-			if (!interactive()) { ctx.ui.notify("Teams require an interactive pi in Herdr.", "error"); return; }
+			if (!interactive()) { ctx.ui.notify("Teams require an interactive pi in the Herdr app.", "error"); return; }
 			try {
 				let msg: string;
 				if (!state.orchestratedBy && !state.teamMode) {
@@ -820,7 +803,7 @@ export default function (pi: ExtensionAPI) {
 					updateUi();
 				}
 				if (!verb || verb === "list" || verb === "status") {
-					msg = [statusText(), ...state.workers.map((w) => `${w}${state.meta?.[w]?.paneId ? ` · ${state.meta[w].paneId}` : ""}`)].filter(Boolean).join("\n") || "No team.";
+					msg = [statusText(), ...state.workers.map((w) => `${w}${state.meta?.[w]?.terminal ? ` · ${state.meta[w].terminal}` : ""}`)].filter(Boolean).join("\n") || "No team.";
 				} else if (verb === "release") {
 					msg = await release(rest[0] ?? "");
 				} else if (verb === "from") {
@@ -843,10 +826,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("orchestrated-by", {
-		description: "Herdr: mark this pi as a worker controlled by <agent name or pane id>",
+		description: "Herdr: mark this pi as a worker controlled by <agent name or hc terminal address>",
 		handler: async (args, ctx) => {
 			try {
-				if (!interactive()) throw new Error("Teams require an interactive pi in Herdr.");
+				if (!interactive()) throw new Error("Teams require an interactive pi in the Herdr app.");
 				ctx.ui.notify(await setOrchestrator(args.trim()), "info");
 			} catch (e: any) {
 				ctx.ui.notify(e.message ?? String(e), "error");
@@ -863,24 +846,24 @@ export default function (pi: ExtensionAPI) {
 		if (isOrchestrator()) {
 			const roster = state.workers.map((w) => {
 				const m = state.meta?.[w];
-				const bits = [m?.type, m?.purpose, m?.model ? `model ${m.model}` : undefined].filter(Boolean);
+				const bits = [m?.terminal ? `terminal ${m.terminal}` : undefined, m?.type, m?.purpose, m?.model ? `model ${m.model}` : undefined].filter(Boolean);
 				return bits.length ? `${w} (${bits.join("; ")})` : w;
 			});
 			sections.push(
 				state.workers.length
-					? `You are the orchestrator for ${roster.join(", ")} — you work through them, but you work hard on giving them the right tasks. Each worker is a separate pi agent in its own herdr pane (same working directory, its own context; it sees nothing of this conversation).`
-					: `You are an orchestrator with no workers yet. Create team members with CreateAgentPanel (type/purpose/model/initial_prompt); they become pi agents in neighboring herdr panes that you task through SendToAgent.`,
+					? `You are the orchestrator for ${roster.join(", ")} — you work through them, but you work hard on giving them the right tasks. Each worker is a separate pi agent in its own Herdr pane (same working directory, its own context; it sees nothing of this conversation).`
+					: `You are an orchestrator with no workers yet. Create team members with CreateAgentPanel (type/purpose/model/initial_prompt); they become pi agents in neighboring Herdr panes that you task through SendToAgent.`,
 				`- Add workers with CreateAgentPanel. Explore/research scouts default to xai/grok-4.6; implementers default to your model. Always hand over a concrete initial_prompt.`,
 				`- Respect each worker's charter: do not ask an explore-only agent to edit files; spawn an implement agent instead.`,
 				`- Delegate with SendToAgent({ target_id, message, priority }). Briefs must be self-contained: goal, relevant context you already have, constraints, definition of done, and what to report back.`,
 				`- priority: true steers the worker mid-task (interrupts its current turn) — use for corrections/stop. priority: false (default) queues a follow-up after its current work.`,
-				`- Replies arrive asynchronously as "[agent]" custom messages on a later turn. Do not poll or block for them; finish your turn. To peek at a worker: \`herdr agent get <id>\`, \`herdr agent read <id> --source recent-unwrapped --lines 80\`.`,
+				`- Replies arrive asynchronously as "[agent]" custom messages on a later turn. Do not poll or block for them; finish your turn. To peek at a worker: \`hc get <terminal>\`, \`hc read <terminal> --lines 80\` (terminal addresses are in /team list).`,
 				`- Your id (workers reply to it): ${me}.`,
 			);
 		}
 		if (state.orchestratedBy) {
 			sections.push(
-				`You are being controlled by an orchestrator: ${state.orchestratedBy} — another of your user's pi agents in a neighboring herdr pane. Task briefs arrive as "[agent]" custom messages; your user sees them too and may chime in directly.`,
+				`You are being controlled by an orchestrator: ${state.orchestratedBy} — another of your user's pi agents in a neighboring Herdr pane. Task briefs arrive as "[agent]" custom messages; your user sees them too and may chime in directly.`,
 				...(state.role?.type || state.role?.purpose
 					? [
 							`- Your role in the team: ${[state.role.type, state.role.purpose].filter(Boolean).join(" — ")}.${state.role.type && TYPE_HINTS[state.role.type] ? ` ${TYPE_HINTS[state.role.type]}` : ""} Stay within this charter; if a request falls outside it, say so to the orchestrator instead of doing it.`,
@@ -901,7 +884,7 @@ export default function (pi: ExtensionAPI) {
 		restore(ctx);
 		if (!interactive()) {
 			state = { workers: [] };
-			syncTool(); // no herdr -> no team -> no tool
+			syncTool(); // no herdr app -> no team -> no tool
 			return;
 		}
 		await refreshSelf();
@@ -928,7 +911,7 @@ export default function (pi: ExtensionAPI) {
 			if (entry.type !== "custom_message" || entry.customType !== "herdr-worker.message") continue;
 			const id = (entry.details as { envelopeId?: string })?.envelopeId;
 			if (id && inFlightEnvelopes.delete(id) && /^[a-zA-Z0-9_.-]+\.json$/.test(id)) {
-				try { fs.rmSync(path.join(inboxDir(SELF_PANE), id), { force: true }); } catch {}
+				try { fs.rmSync(path.join(inboxDir(SELF), id), { force: true }); } catch {}
 			}
 		}
 	}

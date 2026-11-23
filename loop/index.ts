@@ -57,7 +57,7 @@ export default function (pi: ExtensionAPI) {
   triggerSystem = new TriggerSystem(pi, scheduler, store, (entry, origin) => onLoopFire(entry, origin));
 
   const MONITOR_LOG = "herdr-monitors.snapshot.v1";
-  const monitorScope = `${process.env.HERDR_SOCKET_PATH || ""}:${process.env.HERDR_WORKSPACE_ID || ""}`;
+  const monitorScope = `hc:${process.env.HC_TERMINAL_SOCKET || ""}:${process.env.HC_TERMINAL_ID || ""}`;
   const PENDING_LOG = "herdr-loops.pending.v1";
   let readOnlyWake = false;
   const notificationRuntime = createNotificationRuntime({
