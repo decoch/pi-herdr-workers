@@ -1,8 +1,12 @@
 # pi-herdr-workers
 
-One Pi package for **teams of agents in [Herdr](https://herdr.dev) panes**, **`/split-handoff` / `/split-fork`**, **scheduled/event/idle `/loop` re-wakes**, and **background monitors** that are just Herdr panes.
+One Pi package for **teams of agents in [Herdr](https://herdr.dev) app panes**, **`/split-handoff` / `/split-fork`**, **scheduled/event/idle `/loop` re-wakes**, and **background monitors** that are just Herdr panes.
 
-No extra npm dependencies. Peer APIs come from Pi (`pi-coding-agent`, `pi-tui`, `typebox`). Requires a Herdr-managed pane (`HERDR_ENV=1`) for `/team` and monitors.
+No extra npm dependencies. Peer APIs come from Pi (`pi-coding-agent`, `pi-tui`, `typebox`).
+
+Requires the **Herdr Mac app**: pi must run in an app terminal (`HC_TERMINAL_ID` is set), with `hc` (herdr-core) and `herdr-app` on `PATH`. Terminals are driven with `hc` (get / send / keys / read / label) and the window with `herdr-app` (`ls`, `status`, `do pane.split|pane.swap|pane.focus|tab.new`). The old `herdr` TUI CLI (`HERDR_ENV=1`, `herdr pane|agent …`) is not used: its terminals are invisible in the app.
+
+New panes start pi through `/usr/bin/env PATH=<this pi's PATH> /bin/sh -c 'cd … && exec pi …'`, because app terminals get the core's login environment, which can lack mise/nvm entries. Set `PI_HERDR_PI_ARGV` (JSON array, e.g. `["pi","-ne","-e","/path/ext.ts"]`) to start something other than `pi`.
 
 ```bash
 pi install git:github.com/tobi/pi-herdr-workers
@@ -20,17 +24,17 @@ Then `/reload` (or start a new session).
 
 ## `/team` — orchestrator and workers
 
-Turns this pane into an orchestrator and puts other Pi agents in neighboring Herdr panes.
+Turns this pane into an orchestrator and puts other Pi agents in neighboring Herdr app panes.
 
 | Command | Effect |
 |---|---|
 | `/team add [right\|down\|left\|up] [type] [purpose…]` | Enable team mode and have the LLM create a worker with `CreateAgentPanel` |
 | `/team list` | Show workers / orchestrator |
 | `/team release <name>` | Stop orchestrating that worker (pane stays open) |
-| `/team adopt <name>` | Control an existing Herdr agent without creating a pane |
+| `/team adopt <name>` | Control an existing agent (hc address, hc name or team name) without creating a pane |
 | `/team from <id>` | Worker: adopt an orchestrator after startup |
 
-`/team` once flips **team mode**: status shows `Orchestrator …`, the system prompt gets the orchestrator brief, and `CreateAgentPanel` appears. The pane is renamed `orchestrator` if it has no Herdr agent name.
+`/team` once flips **team mode**: status shows `Orchestrator …`, the system prompt gets the orchestrator brief, and `CreateAgentPanel` appears. The orchestrator is addressed by its hc terminal address (e.g. `t3y`) unless its terminal has an hc name.
 
 ### `CreateAgentPanel`
 
@@ -40,7 +44,7 @@ Turns this pane into an orchestrator and puts other Pi agents in neighboring Her
   "thinking": "low", "initial_prompt": "…" }
 ```
 
-Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker on a side splits toward it; further workers on that side stack. Starts `pi --orchestrated-by …` via `herdr agent start`.
+Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`); `herdr-app do pane.split` cannot name a terminal, so the name is stored as the hc label `pi.team.name`. First worker on a side splits toward it (left/up = split, then `pane.swap`); further workers on that side stack below / right of the last one (tracked in team state, since herdr-app reports no pane geometry). The split runs `pi --orchestrated-by … --team-name …` directly, and focus is handed back if the split took it.
 
 ### `SendToAgent`
 
@@ -48,13 +52,13 @@ Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker o
 { "target_id": "agent-explore", "message": "…", "priority": false }
 ```
 
-`priority: true` steers; otherwise follow-up. Transport is a per-pane inbox under `$XDG_RUNTIME_DIR/pi-herdr-worker/`. Pi receives a durable, model-visible custom message attributed to the sending agent, not a fabricated user message. Non-Pi targets fall back to `herdr agent prompt`.
+`priority: true` steers; otherwise follow-up. Transport is a per-terminal inbox under `$XDG_RUNTIME_DIR/pi-herdr-worker/<hc address>/`. Pi receives a durable, model-visible custom message attributed to the sending agent, not a fabricated user message. Non-Pi targets fall back to `hc send`.
 
 ---
 
 ## `/split-handoff` and `/split-fork`
 
-Unfocused named Pi splits in the current Herdr tab (first split right, later ones down).
+Unfocused named Pi splits in the current Herdr app tab (first split right of this pane, later ones below the most recent split of this session still open in the tab). The new pi gets the handoff/fork prompt as its first message (argv), and its terminal is labelled `pi.team.name=split-…`.
 
 | Command | Effect |
 |---|---|
@@ -62,7 +66,7 @@ Unfocused named Pi splits in the current Herdr tab (first split right, later one
 | `/split-fork [instruction]` | Clones the active session branch into a new pane; this pane keeps going |
 | `/splits` | Durable split history; `/splits cancel` aborts a startup |
 
-Status bar shows `split · summarizing` then pane/start/prompt. Herdr layout is the same as before; the missing piece was the handoff write-up.
+Status bar shows `split · summarizing` then pane/prompt.
 
 ---
 
@@ -92,16 +96,16 @@ Read-only wakes enforce a tool-call gate (read/search/list and loop bookkeeping 
 
 ---
 
-## Monitors — Herdr panes, not hidden processes
+## Monitors — Herdr app panes, not hidden processes
 
 `MonitorCreate` / `MonitorList` / `MonitorStop`
 
-- Ensures a **Monitor** tab in the current workspace
-- Each command gets a **down-split** pane titled `mon:<hash> <command>`
+- Ensures a **Monitor** tab in the current space (`herdr-app do tab.new … --focus false`)
+- Each command gets a **down-split** pane whose terminal carries the hc label `pi.monitor=<hash>`; the command is typed with `hc send`
 - **The same command in the same cwd reuses that pane**
 - Panes **stay open** when the command finishes
 - Creating an already-running monitor attaches to it; it never sends `ctrl+c` or restarts it
-- `MonitorStop` validates the pane identity and current process state before sending `ctrl+c` — it does not close the pane
+- `MonitorStop` validates the terminal's label and current foreground process before sending `ctrl+c` (`hc keys`) — it does not close the pane
 - Handles and command/cwd metadata survive reload; restored process status starts **unknown**, and `MonitorList` refreshes it
 
 ```text
@@ -132,7 +136,8 @@ MonitorStop monitorId="1"
 ## Layout
 
 ```text
+lib/herdr-app.ts             hc / herdr-app wrappers shared by everything below
 extensions/herdr-worker.ts   /team, CreateAgentPanel, SendToAgent
 extensions/split-handoff.ts  /split-handoff, /split-fork, /splits
-loop/                        /loop + Monitor* (Herdr-backed)
+loop/                        /loop + Monitor* (Herdr app-backed)
 ```
